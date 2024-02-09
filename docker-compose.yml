@@ -1,0 +1,14 @@
+version: '3.9'
+
+services:
+  
+  hla-typing-pipeline-task:
+    env_file:
+      - dev.env
+    image: hla-typing-pipeline
+    volumes:
+      - ./data:/service/data
+    container_name: hla-typing-pipeline
+    build:
+      context: .
+      dockerfile: ./Dockerfile # change to Dockerfile on Linux
