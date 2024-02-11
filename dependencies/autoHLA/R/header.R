@@ -7,5 +7,5 @@
 #' @importFrom tibble tibble as_tibble
 #' @importFrom flowCore read.FCS compensate
 #' @importFrom KernSmooth bkde
-#' @importFrom uwot umap
+#' @importFrom ggridges geom_ridgeline
 NULL

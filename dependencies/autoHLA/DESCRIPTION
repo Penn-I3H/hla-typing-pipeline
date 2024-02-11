@@ -17,7 +17,7 @@ Imports:
   tidyr,
   KernSmooth,
   flowCore,
-  uwot
+  ggridges
 License: GPL-3
 Encoding: UTF-8
 LazyData: true

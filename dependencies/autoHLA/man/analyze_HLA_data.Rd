@@ -4,7 +4,13 @@
 \alias{analyze_HLA_data}
 \title{Analyze HLA typing files}
 \usage{
-analyze_HLA_data(HLA_data)
+analyze_HLA_data(
+  HLA_data,
+  count_cutoff = 50,
+  A2_cutoff = 0.9,
+  A3_cutoff = 0.9,
+  B7_cutoff = 0.7
+)
 }
 \arguments{
 \item{HLA_data}{A container object of class HLA_data.}

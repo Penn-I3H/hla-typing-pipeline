@@ -61,6 +61,16 @@ read_single_file <- function(path, channels, cofactor=500, scal=4e4) {
 }
 
 
+get_compmat <- function(ff) {
+  ### Hard-coding the spillover values.
+  ### Look for better solution later?
+  compmat <- ff@description$SPILL
+  compmat[2,3] <- 0.058
+  compmat[3,2] <- 0.04
+  return(compmat)
+}
+
+
 
 #' @title A print method for the HLA_data class.
 #' @export
@@ -83,37 +93,31 @@ match_names <- function(x, vals) {
 }
 
 
-kde_single_mat <- function(data, channels, name) {
+kde_single_mat <- function(data, channels, name, m, M) {
   lapply(channels, function(ch) {
-    kde <- bkde(data[,ch])
+    kde <- bkde(data[,ch], range.x = c(m[ch], M[ch]))
     tib <- tibble(intensity=kde$x,
                   density= kde$y / max(kde$y),
                   channel=ch,
-                  samples=name)
+                  file=name)
     return(tib)
-  }) %>% do.call(what=rbind) %>%
-    filter(density > 0.01)
+  }) %>% do.call(what=rbind)
 }
 
 
-get_compmat <- function(ff) {
-  ### Hard-coding the spillover values.
-  ### Look for better solution later?
-  compmat <- ff@description$SPILL
-  compmat[2,3] <- 0.058
-  compmat[3,2] <- 0.04
-  return(compmat)
+get_kdes_all <- function(HLA_data) {
+  channels <- HLA_data$channels
+
+  m <- apply(HLA_data$data_scaled, 2, function(col) quantile(col, 0.005))
+  M <- apply(HLA_data$data_scaled, 2, function(col) quantile(col, 0.995))
+
+  kdes <- lapply(HLA_data$nice_names, function(file) {
+    cells <- which(HLA_data$samples==file)
+    kde <- kde_single_mat(HLA_data$data_scaled[cells,], channels, file, m, M)
+  }) %>% do.call(what=rbind)
+
+  return(kdes)
 }
-
-
-get_umap <- function(data) {
-  um <- umap(data)
-  colnames(um) <- c("umap1", "umap2")
-  tib <- cbind(um, data) %>% as_tibble()
-  # names(tib) <- c("umap1", "umap2", colnames(data))
-  return(tib)
-}
-
 
 
 #' @title Analyze HLA typing files
@@ -122,30 +126,21 @@ get_umap <- function(data) {
 #' @param HLA_data A container object of class HLA_data.
 #' @returns A container object of class HLA_data, updated with analysis results.
 #' @export
-analyze_HLA_data <- function(HLA_data) {
-  HLA_data$thrs <- get_thrs(HLA_data)
-  labels <- classify_cells(HLA_data)
-  # HLA_data$results_df <- get_umap(HLA_data$data_scaled) %>%
-  #   mutate(labels=labels,
-  #          file=HLA_data$samples)
-  HLA_data$results_df <- as_tibble(HLA_data$data_scaled) %>%
-    mutate(labels=labels, file=HLA_data$samples)
+analyze_HLA_data <- function(HLA_data, count_cutoff=50, A2_cutoff=0.9,
+                             A3_cutoff=0.9, B7_cutoff=0.7) {
+  # HLA_data$thrs <- get_thrs(HLA_data)
+  # labels <- classify_cells(HLA_data)
+  #
+  # HLA_data$results_df <- as_tibble(HLA_data$data_scaled) %>%
+  #   mutate(labels=labels, file=HLA_data$samples)
 
-  HLA_data$detailed_df <- collect_sample_info(HLA_data)
-  HLA_data$call_df <- make_call(HLA_data$detailed_df)
-
-  return(HLA_data)
-}
-
-
-make_call <- function(df, count_cutoff=50, A2_cutoff=0.9,
-                      A3_cutoff=0.9, B7_cutoff=0.7) {
-  df %>%
-    select(-call, -label, -none) %>%
-    mutate(A2_frac = round(A2 + A2A3 + A2B7 + A2A3B7,2),
-           A3_frac = round(A3 + A2A3 + A3B7 + A2A3B7,2),
-           B7_frac = round(B7 + A2B7 + A3B7 + A2A3B7,2),
-           .keep="unused") %>%
+  # HLA_data$detailed_df <- collect_sample_info(HLA_data)
+  df_opt <- get_bhatt(HLA_data)
+  HLA_data$call_df <- df_opt %>%
+    select(-conf) %>%
+    mutate(channel = paste0(channel, "_frac")) %>%
+    pivot_wider(names_from=channel, values_from=pos) %>%
+    inner_join(tibble(file=HLA_data$nice_names, count=HLA_data$counts)) %>%
     mutate(A2_call = case_when(count < count_cutoff ~ "Inconclusive: few cells",
                                A2_frac >= A2_cutoff ~ "Positive",
                                A2_frac <= 1-A2_cutoff ~ "Negative",
@@ -159,82 +154,54 @@ make_call <- function(df, count_cutoff=50, A2_cutoff=0.9,
                                B7_frac <= 1-B7_cutoff ~ "Negative",
                                TRUE ~ "Inconclusive: mixed")) %>%
     relocate(file, count)
-}
 
-get_thrs <- function(HLA_data) {
-  pos_cells <- grep("ositive", HLA_data$samples)
-  neg_cells <- grep("egative", HLA_data$samples)
-
-  truth <- c(rep("neg", length(neg_cells)),
-             rep("pos", length(pos_cells)))
-  thrs <- sapply(HLA_data$channels, function(x) 0)
-
-  np <- length(pos_cells)
-  nn <- length(neg_cells)
-  weights <- (nn + np) / c(nn, np)
-
-  for (ch in HLA_data$channels) {
-    m <- mean(HLA_data$data[neg_cells, ch])
-    M <- mean(HLA_data$data[pos_cells, ch])
-    delta <- (M-m)/100
-
-    best_thr <- 0
-    best_acc <- 0
-
-    for (thr in (m+seq(1,99)*delta)) {
-      pred <- if_else(HLA_data$data[c(neg_cells, pos_cells),ch] < thr, "neg", "pos")
-      tn <- length(which(pred=="neg" & truth=="neg"))
-      tp <- length(which(pred=="pos" & truth=="pos"))
-      acc <- (tn/nn *weights[1] + tp/np *weights[2])/sum(weights)
-
-      if (acc > best_acc) {
-        best_acc <- acc
-        best_thr <- thr
-      }
-    }
-
-    thrs[ch] <- best_thr
-  }
-
-  return(thrs)
+  return(HLA_data)
 }
 
 
-classify_cells <- function(HLA_data) {
+bhattacharyya_coeff <- function(x,y) {
+  xnorm <- x/sum(x)
+  ynorm <- y/sum(y)
 
-  labels <- lapply(seq(nrow(HLA_data$data)), function(i) {
-    label <- paste(names(which(HLA_data$data[i,HLA_data$channels] - HLA_data$thrs > 0)), collapse="")
-    if (label == "")
-      label <- "none"
-    return(label)
-  }) %>% do.call(what=c) %>% as.factor()
-
-  return(labels)
+  return(sum(sqrt(xnorm*ynorm)))
 }
 
 
-collect_sample_info <- function(HLA_data) {
-  feat <- table(HLA_data$results_df$file, HLA_data$results_df$labels) %>%
-    apply(1, function(row) row/sum(row)) %>% t()
 
-  df_count <- tibble(file = HLA_data$nice_names,
-                     count = HLA_data$counts)
+get_bhatt <- function(HLA_data) {
+  kdes <- get_kdes_all(HLA_data) %>%
+    mutate(density=pmax(0,density))
 
-  feat_call <- feat %>%
-    as_tibble() %>%
-    mutate(file = row.names(feat)) %>%
-    pivot_longer(where(is.numeric)) %>%
-    filter(value > 0.1) %>%
-    arrange(file, -value) %>%
-    mutate(value = round(value,2)) %>%
-    mutate(lab = paste0(name, "=", value), .keep="unused") %>%
-    group_by(file) %>%
-    summarise(call = paste(lab, collapse="; ")) %>%
-    inner_join(as_tibble(feat) %>% mutate(file=row.names(feat))) %>%
-    inner_join(df_count) %>%
-    mutate(label = paste0(call, "\ncount=", count))
-  return(feat_call)
+  file_neg <- grep("negative", HLA_data$nice_names, ignore.case = TRUE, value=TRUE)
+  file_pos <- grep("positive", HLA_data$nice_names, ignore.case = TRUE, value=TRUE)
+
+  df_bhatt <- lapply(HLA_data$nice_names, function(f) {
+    lapply(HLA_data$channels, function(ch) {
+      dist_neg <- kdes %>% filter(file==file_neg & channel==ch) %>% pull(density)
+      dist_pos <- kdes %>% filter(file==file_pos & channel==ch) %>% pull(density)
+      dist_file <- kdes %>% filter(file==f & channel==ch) %>% pull(density)
+
+      seq_a <- seq(0,1,by=0.01)
+      seq_bc <- lapply(seq_a, function(a) {
+        dist_ref <- (1-a)*dist_neg/sum(dist_neg) + a*dist_pos/sum(dist_pos)
+        bc <- bhattacharyya_coeff(dist_file/sum(dist_file), dist_ref)
+        return(bc)
+      }) %>% do.call(what=c)
+
+      return(tibble(file=f, channel=ch, a=seq_a, bc=seq_bc))
+    }) %>% do.call(what=rbind)
+  }) %>% do.call(what=rbind)
+
+  df_opt <- df_bhatt %>%
+    group_by(file, channel) %>%
+    summarise(pos=a[which.max(bc)],
+              conf=max(bc))
+
+  return(df_opt)
+
+  # df_bhatt %>% filter(file==file_pos & a==0)
 }
+
 
 
 #' @title Plot calls overlaid on data distribution for all files
@@ -244,41 +211,25 @@ collect_sample_info <- function(HLA_data) {
 #' @returns A ggplot2 object.
 #' @export
 make_output_plot <- function(HLA_data) {
-  data_long <- HLA_data$data_scaled %>%
-    as_tibble() %>%
-    mutate(file=HLA_data$samples, label=HLA_data$results_df$labels) %>%
-    pivot_longer(where(is.numeric)) %>%
-    filter(!grepl("FSC|SSC", name))
+  df_kde <- get_kdes_all(HLA_data)
 
-  df_kde <- lapply(HLA_data$nice_names, function(f) {
-    lapply(HLA_data$channels, function(n) {
-      kde <- bkde(data_long %>%
-                    filter(file==f & name==n) %>%
-                    pull(value),
-                  gridsize=101L)
-      return(tibble(fluorescence=kde$x,
-                    density=kde$y/max(kde$y),
-                    file=f,
-                    channel=n) %>%
-               filter(density > 1e-2))
-    }) %>% do.call(what=rbind)
-  }) %>% do.call(what=rbind)
-
-  ymax <- max(df_kde$density)
-  xmin <- min(df_kde$fluorescence)
-  xmax <- max(df_kde$fluorescence)
+  # ymax <- max(df_kde$density)
+  ymax <- 2.5
+  xmin <- min(df_kde$intensity)
+  xmax <- max(df_kde$intensity)
 
   p <- ggplot(df_kde %>% mutate(file = str_replace_all(file, "_", " ")),
-         aes(x=fluorescence, y=density)) +
-    geom_polygon(aes(fill=channel), alpha=0.4) +
-    # geom_ridgeline(aes(fill=channel, y=channel, height=density), alpha=0.4) +
+         aes(x=intensity, y=density)) +
+    # geom_polygon(aes(fill=channel), alpha=0.4) +
+    geom_ridgeline(aes(fill=channel, y=channel, height=density), alpha=0.4) +
     scale_fill_brewer(palette="Dark2") +
     xlab("Intensity (scaled)") +
     ylab("Density (scaled)") +
     geom_vline(linetype="dashed", xintercept=0) +
     facet_wrap(~file, labeller = label_wrap_gen(width=20)) +
-    geom_text(data=HLA_data$detailed_df %>% mutate(file = str_replace_all(file, "_", " ")),
-              aes(label=paste0(call, "\ncount=", count),
+    geom_text(data=HLA_data$call_df %>% mutate(file = str_replace_all(file, "_", " ")),
+              # aes(label=paste0(call, "\ncount=", count),
+              aes(label=paste0("A2=",A2_frac,"; A3=",A3_frac, "; B7=",B7_frac, "\nn=",count),
                   color=count>50),
               x=(xmin+xmax)/2, y=0.75*ymax) +
     scale_color_manual(values=c("TRUE"="black", "FALSE"="red")) +
@@ -308,87 +259,4 @@ plot_heatmap <- function(HLA_data) {
 }
 
 
-#' @title Plot channel distributions and thresholds
-#' @description Shows position of thresholds relative to distribution
-#' of negative controls, positive controls and aggregte data from all files.
-#' @param HLA_data A container object of class HLA_data.
-#' @returns A ggplot2 object.
-#' @export
-plot_thresholds <- function(HLA_data) {
 
-  channels <- HLA_data$channels
-  pos_cells <- grep("positive", HLA_data$samples, ignore.case = TRUE)
-  neg_cells <- grep("negative", HLA_data$samples, ignore.case = TRUE)
-
-  kdes <- rbind(kde_single_mat(HLA_data$data, channels, "all"),
-                kde_single_mat(HLA_data$data[pos_cells,], channels, "positive control"),
-                kde_single_mat(HLA_data$data[neg_cells,], channels, "negative control"))
-
-  p <- ggplot(kdes, aes(x=intensity, y=density, color=samples)) +
-    geom_path() +
-    geom_vline(data=tibble(channel=names(HLA_data$thrs), value=unname(HLA_data$thrs)),
-               aes(xintercept=value), linetype="dashed") +
-    facet_wrap(~channel, scales = "free_x") +
-    ggtitle("Thresholds and data distribution for all channels") +
-    theme_bw(base_size=11)
-
-  return(p)
-}
-
-
-
-#' @title UMAP plot of all cells
-#' @description Produces UMAP plots color coded by expression of all markers
-#' and by HLA type of cells, then saves them to file.
-#' @param HLA_data A container object of class HLA_data.
-#' @param dir_out Path for writing plots.
-#' @returns Nothing.
-#' @export
-plot_umap <- function(HLA_data, dir_out) {
-
-  for (ch in HLA_data$channels) {
-    p <- ggplot(HLA_data$results_df, aes(x=umap1, y=umap2, color=.data[[ch]])) +
-      geom_point() +
-      scale_color_gradient2(low="black", mid="black", high="red") +
-      theme_bw(base_size=14)
-
-    ggsave(paste0(dir_out, "/umap_", ch, ".png"), plot=p, width=9, height=8)
-  }
-
-  p <- ggplot(HLA_data$results_df, aes(x=umap1, y=umap2, color=labels)) +
-    geom_point() +
-    theme_bw(base_size=14)
-
-  ggsave(paste0(dir_out, "/umap_type.png"), plot=p, width=9, height=8)
-}
-
-#' @title Bivariate plots of all cells
-#' @description Produces bivariate plots color coded by HLA type of cells,
-#' then saves them to file.
-#' @param HLA_data A container object of class HLA_data.
-#' @param dir_out Path for writing plots.
-#' @returns Nothing.
-#' @export
-plot_bivariate <- function(HLA_data, dir_out) {
-  p <- ggplot(HLA_data$results_df, aes(x=A2, y=A3, color=labels)) +
-    geom_point(size=0.5, alpha=0.5) +
-    scale_color_brewer(palette="Paired") +
-    guides(color = guide_legend(override.aes = list(alpha = 1, size = 2))) +
-    theme_bw(base_size=12)
-  ggsave(p, filename=paste0(dir_out, "/bivariate_A2_A3.png"), width=9, height=8)
-
-  p <- ggplot(HLA_data$results_df, aes(x=A3, y=B7, color=labels)) +
-    geom_point(size=0.5, alpha=0.5) +
-    scale_color_brewer(palette="Paired") +
-    guides(color = guide_legend(override.aes = list(alpha = 1, size = 2))) +
-    theme_bw(base_size=12)
-  ggsave(p, filename=paste0(dir_out, "/bivariate_A3_B7.png"), width=9, height=8)
-
-  p <- ggplot(HLA_data$results_df, aes(x=B7, y=A2, color=labels)) +
-    geom_point(size=0.5, alpha=0.5) +
-    scale_color_brewer(palette="Paired") +
-    guides(color = guide_legend(override.aes = list(alpha = 1, size = 2))) +
-    theme_bw(base_size=12)
-  ggsave(p, filename=paste0(dir_out, "/bivariate_B7_A2.png"), width=9, height=8)
-
-}
